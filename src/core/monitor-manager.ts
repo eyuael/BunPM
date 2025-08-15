@@ -1,0 +1,2 @@
+// Monitor manager - placeholder
+export {};

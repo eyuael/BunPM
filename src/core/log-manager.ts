@@ -1,0 +1,2 @@
+// Log manager - placeholder
+export {};

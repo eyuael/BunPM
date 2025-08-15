@@ -1,0 +1,39 @@
+{
+  "name": "bun-process-manager",
+  "version": "1.0.0",
+  "description": "A Bun-native process manager inspired by PM2",
+  "main": "dist/cli/index.js",
+  "type": "module",
+  "bin": {
+    "bun-pm": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/cli/index.ts --outdir dist --target bun",
+    "dev": "bun run src/cli/index.ts",
+    "test": "bun test",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "bun",
+    "process-manager",
+    "pm2",
+    "daemon",
+    "clustering"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "bun": ">=1.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ]
+}
