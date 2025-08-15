@@ -1,6 +1,6 @@
 # Bun Process Manager
 
-A Bun-native process manager inspired by PM2 that leverages Bun's built-in tools and APIs to provide fast, efficient process management for Node.js and Bun applications.
+A Bun-native process manager inspired by PM2 that leverages Bun's built-in tools and APIs to provide fast, efficient process management for Node.js and Bun applications. (STILL IN PROGRESS)
 
 ## Installation
 
