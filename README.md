@@ -18,7 +18,7 @@ A Bun-native process manager inspired by PM2 that leverages Bun's built-in tools
 ### From Source
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/eyuael/BunPM.git
 cd bun-process-manager
 bun install
 bun run build
