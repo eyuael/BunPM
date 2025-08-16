@@ -1,0 +1,43 @@
+{
+  "apps": [
+    {
+      "name": "frontend-dev",
+      "script": "dev-server.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "512M",
+      "cwd": "./frontend",
+      "env": {
+        "NODE_ENV": "development",
+        "PORT": 3000,
+        "API_URL": "http://localhost:8000",
+        "HOT_RELOAD": "true"
+      }
+    },
+    {
+      "name": "backend-dev",
+      "script": "server.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "256M",
+      "cwd": "./backend",
+      "env": {
+        "NODE_ENV": "development",
+        "PORT": 8000,
+        "DEBUG": "app:*",
+        "DB_URL": "sqlite://./dev.db"
+      }
+    },
+    {
+      "name": "test-runner",
+      "script": "test-watch.js",
+      "instances": 1,
+      "autorestart": false,
+      "memory": "256M",
+      "env": {
+        "NODE_ENV": "test",
+        "WATCH_MODE": "true"
+      }
+    }
+  ]
+}

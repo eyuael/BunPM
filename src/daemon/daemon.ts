@@ -5,6 +5,7 @@ import { ProcessManager } from "../core/process-manager.js";
 import { LogManager } from "../core/log-manager.js";
 import { ConfigManager } from "../core/config-manager.js";
 import { MonitorManager } from "../core/monitor-manager.js";
+import { DaemonManager } from "../core/daemon-manager.js";
 import {
     IPCMessage,
     IPCResponse,
@@ -14,6 +15,17 @@ import {
     DaemonState,
     validateProcessConfig
 } from "../types/index.js";
+import {
+    ErrorHandler,
+    InvalidConfigurationError,
+    ConfigurationFileNotFoundError,
+    createUserFriendlyError
+} from "../core/error-handler.js";
+import { 
+    MemoryTracker, 
+    GCOptimizer, 
+    OptimizedProcessConfigStore 
+} from "../core/memory-optimizer.js";
 
 /**
  * Main daemon class that manages processes and handles IPC communication
@@ -24,10 +36,14 @@ export class ProcessDaemon {
     private logManager: LogManager;
     private configManager: ConfigManager;
     private monitorManager: MonitorManager;
+    private daemonManager: DaemonManager;
     private socketPath: string;
     private stateFilePath: string;
     private isRunning: boolean = false;
-    private processConfigs: Map<string, ProcessConfig> = new Map();
+    private processConfigs: OptimizedProcessConfigStore = new OptimizedProcessConfigStore();
+    private errorHandler: ErrorHandler;
+    private memoryTracker: MemoryTracker;
+    private gcOptimizer: GCOptimizer;
 
     constructor(socketPath?: string) {
         this.socketPath = socketPath || getDefaultSocketPath();
@@ -37,6 +53,10 @@ export class ProcessDaemon {
         this.monitorManager = new MonitorManager();
         this.processManager = new ProcessManager(this.logManager, this.monitorManager);
         this.configManager = new ConfigManager();
+        this.daemonManager = new DaemonManager(this.socketPath);
+        this.errorHandler = new ErrorHandler();
+        this.memoryTracker = new MemoryTracker(100);
+        this.gcOptimizer = new GCOptimizer(this.memoryTracker);
 
         this.setupCommandHandlers();
     }
@@ -56,6 +76,9 @@ export class ProcessDaemon {
                 mkdirSync(daemonDir, { recursive: true });
             }
 
+            // Write PID file
+            await this.daemonManager.writePidFile(process.pid);
+
             // Load previous state if it exists
             await this.loadState();
 
@@ -65,13 +88,24 @@ export class ProcessDaemon {
             // Set up graceful shutdown handlers
             this.setupShutdownHandlers();
 
+            // Start memory optimization
+            this.gcOptimizer.startPeriodicGC();
+            this.memoryTracker.recordMeasurement();
+            
+            // Start periodic memory optimization
+            setInterval(() => {
+                this.optimizeMemory();
+            }, 60000); // Every minute
+
             this.isRunning = true;
 
             // Save current daemon state
             await this.saveState();
 
-            console.log(`Process daemon started on ${this.socketPath}`);
+            console.log(`Process daemon started on ${this.socketPath} (PID: ${process.pid})`);
         } catch (error) {
+            // Clean up PID file if startup failed
+            await this.daemonManager.removePidFile();
             throw new Error(`Failed to start daemon: ${error}`);
         }
     }
@@ -96,8 +130,14 @@ export class ProcessDaemon {
             // Clean up monitoring
             this.monitorManager.cleanup();
 
+            // Stop memory optimization
+            this.gcOptimizer.stopPeriodicGC();
+
             // Stop IPC server
             await this.ipcServer.stop();
+
+            // Clean up PID file
+            await this.daemonManager.removePidFile();
 
             // Clean up state file
             await this.cleanupStateFile();
@@ -107,6 +147,8 @@ export class ProcessDaemon {
             console.log('Daemon stopped successfully');
         } catch (error) {
             console.error(`Error during daemon shutdown: ${error}`);
+            // Still try to clean up PID file even if other cleanup failed
+            await this.daemonManager.removePidFile();
             throw error;
         }
     }
@@ -153,6 +195,14 @@ export class ProcessDaemon {
         // Monitoring commands
         this.ipcServer.registerHandler('monit', this.handleMonitCommand.bind(this));
         this.ipcServer.registerHandler('show', this.handleShowCommand.bind(this));
+
+        // Error handling commands
+        this.ipcServer.registerHandler('errors', this.handleErrorsCommand.bind(this));
+        this.ipcServer.registerHandler('errorStats', this.handleErrorStatsCommand.bind(this));
+
+        // Performance and memory commands
+        this.ipcServer.registerHandler('memoryStats', this.handleMemoryStatsCommand.bind(this));
+        this.ipcServer.registerHandler('performanceStats', this.handlePerformanceStatsCommand.bind(this));
     }
 
     /**
@@ -165,7 +215,9 @@ export class ProcessDaemon {
             // Validate process configuration
             const validation = validateProcessConfig(config);
             if (!validation.isValid) {
-                return createErrorResponse(message.id, `Invalid configuration: ${validation.errors.join(', ')}`);
+                const error = new InvalidConfigurationError(validation.errors, { config });
+                await this.errorHandler.handleError(error);
+                return createErrorResponse(message.id, error.getUserMessage());
             }
 
             // Check if process already exists
@@ -192,7 +244,9 @@ export class ProcessDaemon {
                 }))
             });
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            // Handle the error through our error handler
+            await this.errorHandler.handleError(error instanceof Error ? error : new Error(String(error)));
+            const errorMessage = createUserFriendlyError(error instanceof Error ? error : new Error(String(error)));
             return createErrorResponse(message.id, errorMessage);
         }
     }
@@ -354,28 +408,105 @@ export class ProcessDaemon {
      */
     private async handleDeleteCommand(message: IPCMessage): Promise<IPCResponse> {
         try {
-            const { id } = message.payload;
+            const { identifier, force } = message.payload;
 
-            if (!id) {
-                return createErrorResponse(message.id, 'Process id is required');
+            if (!identifier) {
+                return createErrorResponse(message.id, 'Process identifier is required');
             }
 
-            // Stop the process first
+            // Find the base configuration by ID or name
+            let baseConfigId = identifier;
+            let processConfig = this.processConfigs.get(identifier);
+            
+            // If not found by ID, search by name
+            if (!processConfig) {
+                for (const [configId, config] of this.processConfigs.entries()) {
+                    if (config.name === identifier) {
+                        baseConfigId = configId;
+                        processConfig = config;
+                        break;
+                    }
+                }
+            }
+            
+            // Handle clustered process ID (e.g., "app_0" -> "app")
+            if (!processConfig && identifier.includes('_')) {
+                baseConfigId = identifier.split('_')[0];
+                processConfig = this.processConfigs.get(baseConfigId);
+            }
+
+            // Find all matching processes (including clustered instances)
+            const processes = this.processManager.list();
+            const matchingProcesses = processes.filter(p => 
+                p.id === identifier || 
+                p.id === baseConfigId ||
+                p.id.startsWith(`${baseConfigId}_`) ||
+                (processConfig && p.id.startsWith(`${processConfig.id}_`))
+            );
+            
+            // Check if we have a config or running processes for this identifier
+            if (!processConfig && matchingProcesses.length === 0) {
+                return createErrorResponse(message.id, `Process '${identifier}' not found`);
+            }
+
+            const stoppedInstances: string[] = [];
+            let removedLogs = false;
+
+            // Stop all running instances
+            if (matchingProcesses.length > 0) {
+                for (const process of matchingProcesses) {
+                    try {
+                        await this.processManager.stop(process.id);
+                        stoppedInstances.push(process.id);
+                    } catch (error) {
+                        // Log error but continue with deletion
+                        console.warn(`Warning: Failed to stop process ${process.id}: ${error}`);
+                    }
+                }
+            }
+
+            // Clean up log files for the process
             try {
-                await this.processManager.stop(id);
+                if (processConfig) {
+                    await this.logManager.cleanupLogs(processConfig.id);
+                    removedLogs = true;
+                }
             } catch (error) {
-                // Process might not be running, continue with deletion
+                // Log error but continue with deletion
+                console.warn(`Warning: Failed to cleanup logs for ${identifier}: ${error}`);
             }
 
-            // Remove configuration
-            this.processConfigs.delete(id);
+            // Remove configuration from memory and persistent storage
+            if (processConfig) {
+                this.processConfigs.delete(baseConfigId);
+            }
+
+            // Stop monitoring for all instances
+            for (const process of matchingProcesses) {
+                this.monitorManager.stopMonitoring(process.id);
+            }
+
+            // Save updated state
             await this.saveState();
 
+            const processName = processConfig?.name || identifier;
+            const instanceCount = stoppedInstances.length;
+            
+            let message_text = `Process '${processName}' deleted successfully`;
+            if (instanceCount > 0) {
+                message_text += ` (stopped ${instanceCount} instance${instanceCount > 1 ? 's' : ''})`;
+            }
+
             return createSuccessResponse(message.id, {
-                message: `Process '${id}' deleted successfully`
+                message: message_text,
+                processId: baseConfigId,
+                processName: processName,
+                stoppedInstances: stoppedInstances,
+                removedLogs: removedLogs
             });
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            await this.errorHandler.handleError(error instanceof Error ? error : new Error(String(error)));
+            const errorMessage = createUserFriendlyError(error instanceof Error ? error : new Error(String(error)));
             return createErrorResponse(message.id, errorMessage);
         }
     }
@@ -865,6 +996,81 @@ export class ProcessDaemon {
     }
 
     /**
+     * Handle errors command - get error history
+     */
+    private async handleErrorsCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const { limit } = message.payload;
+            const errors = this.errorHandler.getErrorHistory(limit);
+            const processManagerErrors = this.processManager.getErrorHistory(limit);
+
+            // Combine errors from daemon and process manager
+            const allErrors = [...errors, ...processManagerErrors]
+                .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+                .slice(0, limit || 50);
+
+            return createSuccessResponse(message.id, {
+                errors: allErrors,
+                totalCount: allErrors.length
+            });
+        } catch (error) {
+            await this.errorHandler.handleError(error instanceof Error ? error : new Error(String(error)));
+            const errorMessage = createUserFriendlyError(error instanceof Error ? error : new Error(String(error)));
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
+     * Handle error stats command - get error statistics
+     */
+    private async handleErrorStatsCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const daemonStats = this.errorHandler.getErrorStats();
+            const processManagerStats = this.processManager.getErrorStats();
+
+            // Combine statistics
+            const combinedStats = {
+                daemon: daemonStats,
+                processManager: processManagerStats,
+                combined: {
+                    total: daemonStats.total + processManagerStats.total,
+                    recent: daemonStats.recent + processManagerStats.recent,
+                    byCategory: {} as Record<string, number>,
+                    bySeverity: {} as Record<string, number>
+                }
+            };
+
+            // Combine category counts
+            const allCategories = new Set([
+                ...Object.keys(daemonStats.byCategory),
+                ...Object.keys(processManagerStats.byCategory)
+            ]);
+            for (const category of allCategories) {
+                combinedStats.combined.byCategory[category] = 
+                    (daemonStats.byCategory[category as any] || 0) + 
+                    (processManagerStats.byCategory[category as any] || 0);
+            }
+
+            // Combine severity counts
+            const allSeverities = new Set([
+                ...Object.keys(daemonStats.bySeverity),
+                ...Object.keys(processManagerStats.bySeverity)
+            ]);
+            for (const severity of allSeverities) {
+                combinedStats.combined.bySeverity[severity] = 
+                    (daemonStats.bySeverity[severity as any] || 0) + 
+                    (processManagerStats.bySeverity[severity as any] || 0);
+            }
+
+            return createSuccessResponse(message.id, combinedStats);
+        } catch (error) {
+            await this.errorHandler.handleError(error instanceof Error ? error : new Error(String(error)));
+            const errorMessage = createUserFriendlyError(error instanceof Error ? error : new Error(String(error)));
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
      * Clean up state file
      */
     private async cleanupStateFile(): Promise<void> {
@@ -874,6 +1080,56 @@ export class ProcessDaemon {
             }
         } catch (error) {
             console.error('Failed to cleanup state file:', error);
+        }
+    }
+
+    /**
+     * Handle memory statistics command
+     */
+    private async handleMemoryStatsCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const daemonMemory = this.memoryTracker.getMemoryStats();
+            const logManagerMemory = this.logManager.getMemoryStats();
+            const monitorManagerMemory = this.monitorManager.getMemoryStats();
+            const configStoreMemory = this.processConfigs.getMemoryStats();
+            const ipcStats = this.ipcServer.getConnectionStats();
+
+            return createSuccessResponse(message.id, {
+                daemon: daemonMemory,
+                logManager: logManagerMemory,
+                monitorManager: monitorManagerMemory,
+                configStore: configStoreMemory,
+                ipc: ipcStats,
+                processMemory: process.memoryUsage()
+            });
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
+     * Handle performance statistics command
+     */
+    private async handlePerformanceStatsCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const processes = this.processManager.list();
+            const uptime = process.uptime();
+            const memoryStats = this.memoryTracker.getMemoryStats();
+            
+            return createSuccessResponse(message.id, {
+                daemon: {
+                    uptime,
+                    processCount: processes.length,
+                    memoryUsage: memoryStats?.current || process.memoryUsage(),
+                    connectionCount: this.ipcServer.getConnectionCount()
+                },
+                processes: processes.length,
+                memory: memoryStats
+            });
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            return createErrorResponse(message.id, errorMessage);
         }
     }
 
@@ -918,5 +1174,29 @@ export class ProcessDaemon {
             }
             process.exit(1);
         });
+    }
+
+    /**
+     * Optimize memory usage across all components
+     */
+    private optimizeMemory(): void {
+        try {
+            // Record memory measurement
+            this.memoryTracker.recordMeasurement();
+            
+            // Optimize log manager memory
+            this.logManager.optimizeMemory();
+            
+            // Optimize monitor manager memory
+            this.monitorManager.optimizeMemory();
+            
+            // Force garbage collection if memory usage is high
+            const memoryStats = this.memoryTracker.getMemoryStats();
+            if (memoryStats && memoryStats.current.heapUsed > 100 * 1024 * 1024) { // > 100MB
+                this.gcOptimizer.performOptimizedGC();
+            }
+        } catch (error) {
+            console.error('Error during memory optimization:', error);
+        }
     }
 }

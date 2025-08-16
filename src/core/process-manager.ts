@@ -8,6 +8,15 @@ import {
 } from "../types/index.js";
 import { LogManager } from "./log-manager.js";
 import { MonitorManager } from "./monitor-manager.js";
+import {
+  ErrorHandler,
+  ProcessStartupError,
+  ProcessCrashError,
+  ProcessRestartLimitError,
+  ProcessMemoryLimitError,
+  FileNotFoundError,
+  createUserFriendlyError
+} from "./error-handler.js";
 
 /**
  * Core process manager that handles process lifecycle operations
@@ -19,10 +28,12 @@ export class ProcessManager {
   private logManager: LogManager;
   private monitorManager?: MonitorManager;
   private memoryCheckInterval?: Timer;
+  private errorHandler: ErrorHandler;
 
   constructor(logManager?: LogManager, monitorManager?: MonitorManager) {
     this.logManager = logManager || new LogManager();
     this.monitorManager = monitorManager;
+    this.errorHandler = new ErrorHandler();
 
     // Set up periodic memory limit checking (every 30 seconds)
     if (this.monitorManager) {
@@ -46,7 +57,13 @@ export class ProcessManager {
 
       // Check if process already exists
       if (this.processes.has(instanceId)) {
-        throw new Error(`Process with id '${instanceId}' already exists`);
+        const error = new ProcessStartupError(
+          instanceId,
+          'Process already exists',
+          { existingProcess: true }
+        );
+        await this.errorHandler.handleError(error);
+        throw error;
       }
 
       try {
@@ -62,7 +79,13 @@ export class ProcessManager {
           this.monitorManager.startMonitoring(instanceId, instance.pid, instance.startTime);
         }
       } catch (error) {
-        throw new Error(`Failed to start process '${instanceId}': ${error}`);
+        const processError = new ProcessStartupError(
+          instanceId,
+          error instanceof Error ? error.message : String(error),
+          { originalError: error, config }
+        );
+        await this.errorHandler.handleError(processError, this);
+        throw processError;
       }
     }
 
@@ -75,7 +98,9 @@ export class ProcessManager {
   async stop(id: string): Promise<void> {
     const instance = this.processes.get(id);
     if (!instance) {
-      throw new Error(`Process with id '${id}' not found`);
+      const error = new ProcessStartupError(id, 'Process not found', { operation: 'stop' });
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Clear any restart timeout
@@ -115,7 +140,13 @@ export class ProcessManager {
         this.processes.delete(id);
       }, 100);
     } catch (error) {
-      throw new Error(`Failed to stop process '${id}': ${error}`);
+      const processError = new ProcessStartupError(
+        id,
+        error instanceof Error ? error.message : String(error),
+        { operation: 'stop', originalError: error }
+      );
+      await this.errorHandler.handleError(processError);
+      throw processError;
     }
   }
 
@@ -125,14 +156,22 @@ export class ProcessManager {
   async restart(id: string): Promise<ProcessInstance> {
     const instance = this.processes.get(id);
     if (!instance) {
-      throw new Error(`Process with id '${id}' not found`);
+      const error = new ProcessStartupError(id, 'Process not found', { operation: 'restart' });
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Get the stored configuration
     const baseId = id.includes('_') ? id.split('_')[0] : id;
     const config = this.processConfigs.get(baseId);
     if (!config) {
-      throw new Error(`Configuration for process '${baseId}' not found`);
+      const error = new ProcessStartupError(
+        baseId,
+        'Configuration not found',
+        { operation: 'restart', processId: id }
+      );
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Stop the current process
@@ -210,7 +249,13 @@ export class ProcessManager {
    */
   async scale(id: string, instances: number): Promise<ProcessInstance[]> {
     if (instances < 1) {
-      throw new Error('Instance count must be at least 1');
+      const error = new ProcessStartupError(
+        id,
+        'Invalid instance count',
+        { operation: 'scale', instances, reason: 'Instance count must be at least 1' }
+      );
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Find the base process ID (remove instance suffix if present)
@@ -225,7 +270,13 @@ export class ProcessManager {
       .map(([, instance]) => instance);
 
     if (processInstances.length === 0) {
-      throw new Error(`No processes found with id '${id}'`);
+      const error = new ProcessStartupError(
+        id,
+        'Process not found',
+        { operation: 'scale', instances }
+      );
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     const currentCount = processInstances.length;
@@ -237,7 +288,13 @@ export class ProcessManager {
     // Get the stored configuration for this process
     const config = this.processConfigs.get(baseId);
     if (!config) {
-      throw new Error(`Configuration for process '${baseId}' not found`);
+      const error = new ProcessStartupError(
+        baseId,
+        'Configuration not found',
+        { operation: 'scale', processId: id, instances }
+      );
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Update the config instances count
@@ -315,6 +372,26 @@ export class ProcessManager {
   private async spawnProcess(config: ProcessConfig, instanceId: string, instanceIndex: number): Promise<ProcessInstance> {
     const scriptPath = resolve(config.cwd, config.script);
 
+    // Check if script file exists
+    try {
+      const file = Bun.file(scriptPath);
+      if (!(await file.exists())) {
+        throw new FileNotFoundError(scriptPath, { processId: instanceId, config });
+      }
+    } catch (error) {
+      if (error instanceof FileNotFoundError) {
+        await this.errorHandler.handleError(error);
+        throw error;
+      }
+      // Handle other file access errors
+      const fileError = new FileNotFoundError(
+        scriptPath,
+        { processId: instanceId, config, originalError: error }
+      );
+      await this.errorHandler.handleError(fileError);
+      throw fileError;
+    }
+
     // Prepare environment variables
     const env = { ...process.env, ...config.env };
 
@@ -340,7 +417,13 @@ export class ProcessManager {
 
       // Ensure we have a valid PID
       if (!subprocess.pid) {
-        throw new Error('Failed to get process PID');
+        const error = new ProcessStartupError(
+          instanceId,
+          'Failed to get process PID',
+          { config, scriptPath }
+        );
+        await this.errorHandler.handleError(error);
+        throw error;
       }
 
       // Create process instance
@@ -351,7 +434,13 @@ export class ProcessManager {
 
       return instance;
     } catch (error) {
-      throw new Error(`Failed to spawn process: ${error}`);
+      const processError = new ProcessStartupError(
+        instanceId,
+        error instanceof Error ? error.message : String(error),
+        { config, scriptPath, originalError: error }
+      );
+      await this.errorHandler.handleError(processError);
+      throw processError;
     }
   }
 
@@ -385,7 +474,21 @@ export class ProcessManager {
       }
 
       const currentMemory = this.monitorManager.getCurrentMemoryUsage(instanceId);
-      console.log(`Process ${instanceId} exceeded memory limit (${currentMemory} bytes > ${config.memoryLimit} bytes), restarting...`);
+      
+      // Create memory limit error
+      const memoryError = new ProcessMemoryLimitError(
+        instanceId,
+        currentMemory,
+        config.memoryLimit,
+        { restartCount: instance.restartCount }
+      );
+      
+      // Handle the error (this will log it appropriately)
+      this.errorHandler.handleError(memoryError, this).then(result => {
+        if (result.recovered) {
+          console.log(`Memory limit recovery initiated for process ${instanceId}`);
+        }
+      });
       
       // Update restart count for monitoring
       if (this.monitorManager) {
@@ -394,7 +497,7 @@ export class ProcessManager {
 
       // Restart the process due to memory limit violation (requirement 2.5)
       this.restartDueToMemoryLimit(instanceId).catch(error => {
-        console.error(`Failed to restart process ${instanceId} due to memory limit:`, error);
+        this.errorHandler.handleError(error instanceof Error ? error : new Error(String(error)));
       });
     }
   }
@@ -407,12 +510,24 @@ export class ProcessManager {
     const config = this.getConfig(instanceId);
     
     if (!instance || !config) {
-      throw new Error(`Process ${instanceId} not found for memory limit restart`);
+      const error = new ProcessStartupError(
+        instanceId,
+        'Process not found for memory limit restart',
+        { operation: 'memory-limit-restart' }
+      );
+      await this.errorHandler.handleError(error);
+      throw error;
     }
 
     // Check if we can still restart (respect maxRestarts limit)
     if (instance.restartCount >= config.maxRestarts) {
-      console.error(`Process ${instanceId} exceeded max restart attempts (${config.maxRestarts}) due to memory limits, marking as errored`);
+      const error = new ProcessRestartLimitError(
+        instanceId,
+        config.maxRestarts,
+        { reason: 'memory-limit-exceeded', restartCount: instance.restartCount }
+      );
+      await this.errorHandler.handleError(error);
+      
       const erroredInstance = updateProcessStatus(instance, 'errored');
       this.processes.set(instanceId, erroredInstance);
       return;
@@ -482,7 +597,7 @@ export class ProcessManager {
     const subprocess = instance.subprocess;
 
     // Monitor process exit
-    subprocess.exited.then((exitCode) => {
+    subprocess.exited.then(async (exitCode) => {
       const currentInstance = this.processes.get(instance.id);
       if (!currentInstance) {
         console.log(`Process ${instance.id} exited but no longer tracked (exit code: ${exitCode})`);
@@ -508,12 +623,24 @@ export class ProcessManager {
         setTimeout(() => this.processes.delete(instance.id), 100);
       } else {
         // Unexpected exit - handle restart if enabled (requirement 2.1)
-        console.log(`Process ${instance.id} crashed (exit code: ${exitCode}), restart count: ${currentInstance.restartCount}/${config.maxRestarts}`);
+        const crashError = new ProcessCrashError(
+          instance.id,
+          exitCode,
+          undefined,
+          { restartCount: currentInstance.restartCount, maxRestarts: config.maxRestarts }
+        );
+
+        // Handle the crash error
+        this.errorHandler.handleError(crashError, this).then(result => {
+          if (result.recovered) {
+            console.log(`Process crash recovery initiated for ${instance.id}`);
+          }
+        });
 
         if (config.autorestart) {
           // Attempt restart within 1 second (requirement 2.1)
           console.log(`Attempting to restart process ${instance.id}`);
-          this.handleProcessRestart(currentInstance, config);
+          await this.handleProcessRestart(currentInstance, config);
         } else {
           // Autorestart disabled (requirement 2.3)
           console.log(`Process ${instance.id} crashed but autorestart is disabled, marking as errored`);
@@ -536,10 +663,16 @@ export class ProcessManager {
   /**
    * Handle automatic process restart with exponential backoff
    */
-  private handleProcessRestart(instance: ProcessInstance, config: ProcessConfig): void {
+  private async handleProcessRestart(instance: ProcessInstance, config: ProcessConfig): Promise<void> {
     // Check if we've exceeded max restart attempts BEFORE incrementing (requirement 2.2)
     if (instance.restartCount >= config.maxRestarts) {
-      console.error(`Process ${instance.id} exceeded max restart attempts (${config.maxRestarts}), marking as errored`);
+      const error = new ProcessRestartLimitError(
+        instance.id,
+        config.maxRestarts,
+        { restartCount: instance.restartCount }
+      );
+      await this.errorHandler.handleError(error);
+      
       const erroredInstance = updateProcessStatus(instance, 'errored');
       this.processes.set(instance.id, erroredInstance);
       return;
@@ -593,16 +726,27 @@ export class ProcessManager {
 
         console.log(`Process ${instance.id} restarted successfully (PID: ${newInstance.pid})`);
       } catch (error) {
-        console.error(`Failed to restart process ${instance.id}:`, error);
+        const restartError = new ProcessStartupError(
+          instance.id,
+          error instanceof Error ? error.message : String(error),
+          { operation: 'auto-restart', restartCount: restartingInstance.restartCount, originalError: error }
+        );
+        await this.errorHandler.handleError(restartError);
 
         // Check if we've exceeded max restart attempts after failure
         if (restartingInstance.restartCount >= config.maxRestarts) {
-          console.error(`Process ${instance.id} exceeded max restart attempts (${config.maxRestarts}), marking as errored`);
+          const limitError = new ProcessRestartLimitError(
+            instance.id,
+            config.maxRestarts,
+            { restartCount: restartingInstance.restartCount, reason: 'restart-failed' }
+          );
+          await this.errorHandler.handleError(limitError);
+          
           const erroredInstance = updateProcessStatus(restartingInstance, 'errored');
           this.processes.set(instance.id, erroredInstance);
         } else {
           // Try again with current count
-          this.handleProcessRestart(restartingInstance, config);
+          await this.handleProcessRestart(restartingInstance, config);
         }
       }
     }, backoffDelay);
@@ -615,6 +759,27 @@ export class ProcessManager {
    */
   private async spawnSingleInstance(config: ProcessConfig, instanceId: string, instanceIndex: number): Promise<ProcessInstance> {
     return this.spawnProcess(config, instanceId, instanceIndex);
+  }
+
+  /**
+   * Get error handler for external access
+   */
+  getErrorHandler(): ErrorHandler {
+    return this.errorHandler;
+  }
+
+  /**
+   * Get error statistics
+   */
+  getErrorStats() {
+    return this.errorHandler.getErrorStats();
+  }
+
+  /**
+   * Get recent error history
+   */
+  getErrorHistory(limit?: number) {
+    return this.errorHandler.getErrorHistory(limit);
   }
 
   /**

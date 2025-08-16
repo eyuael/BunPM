@@ -1,4 +1,5 @@
 import { ProcessMetrics } from "../types/index.js";
+import { CircularBuffer, MemoryTracker } from "./memory-optimizer.js";
 
 /**
  * System resource information
@@ -20,12 +21,13 @@ interface ProcessResourceUsage {
 }
 
 /**
- * Monitor manager for tracking process resource usage
+ * Monitor manager for tracking process resource usage with memory optimization
  */
 export class MonitorManager {
   private monitoredProcesses = new Map<string, ProcessResourceUsage>();
-  private metricsHistory = new Map<string, ProcessMetrics[]>();
+  private metricsHistory = new Map<string, CircularBuffer<ProcessMetrics>>();
   private monitoringIntervals = new Map<string, Timer>();
+  private memoryTracker = new MemoryTracker(50);
   private readonly MONITORING_INTERVAL = 5000; // 5 seconds
   private readonly MAX_HISTORY_LENGTH = 100;
 
@@ -44,9 +46,9 @@ export class MonitorManager {
       startTime
     });
 
-    // Initialize metrics history
+    // Initialize metrics history with circular buffer
     if (!this.metricsHistory.has(processId)) {
-      this.metricsHistory.set(processId, []);
+      this.metricsHistory.set(processId, new CircularBuffer<ProcessMetrics>(this.MAX_HISTORY_LENGTH));
     }
 
     // Start monitoring interval
@@ -114,7 +116,8 @@ export class MonitorManager {
    * Get metrics history for a process
    */
   getMetricsHistory(processId: string): ProcessMetrics[] {
-    return this.metricsHistory.get(processId) || [];
+    const buffer = this.metricsHistory.get(processId);
+    return buffer ? buffer.toArray() : [];
   }
 
   /**
@@ -157,11 +160,14 @@ export class MonitorManager {
    */
   updateRestartCount(processId: string, restartCount: number): void {
     // Store restart count in a separate map or update existing metrics
-    const history = this.metricsHistory.get(processId) || [];
-    if (history.length > 0) {
-      const lastEntry = history[history.length - 1];
-      if (lastEntry) {
-        lastEntry.restarts = restartCount;
+    const buffer = this.metricsHistory.get(processId);
+    if (buffer) {
+      const history = buffer.toArray();
+      if (history.length > 0) {
+        const lastEntry = history[history.length - 1];
+        if (lastEntry) {
+          lastEntry.restarts = restartCount;
+        }
       }
     }
   }
@@ -207,7 +213,7 @@ export class MonitorManager {
       processData.cpu = cpu;
       processData.memory = memory;
 
-      // Add to history
+      // Add to history using circular buffer
       const uptime = Math.floor((Date.now() - processData.startTime.getTime()) / 1000);
       const restarts = this.getRestartCount(processId);
 
@@ -218,15 +224,15 @@ export class MonitorManager {
         restarts
       };
 
-      const metricsHistory = this.metricsHistory.get(processId) || [];
-      metricsHistory.push(metrics);
-
-      // Limit history size
-      if (metricsHistory.length > this.MAX_HISTORY_LENGTH) {
-        metricsHistory.shift();
+      const buffer = this.metricsHistory.get(processId);
+      if (buffer) {
+        buffer.push(metrics);
       }
 
-      this.metricsHistory.set(processId, metricsHistory);
+      // Record memory usage periodically
+      if (Math.random() < 0.1) { // 10% chance to record memory
+        this.memoryTracker.recordMeasurement();
+      }
     } catch (error) {
       console.error(`Failed to collect metrics for process ${processId}:`, error);
     }
@@ -365,6 +371,46 @@ export class MonitorManager {
     // Clear all data
     this.monitoringIntervals.clear();
     this.monitoredProcesses.clear();
+    
+    // Clear circular buffers
+    for (const buffer of this.metricsHistory.values()) {
+      buffer.clear();
+    }
     this.metricsHistory.clear();
+    
+    // Clear memory tracker
+    this.memoryTracker.clear();
+  }
+
+  /**
+   * Get memory usage statistics for the monitor manager
+   */
+  getMemoryStats() {
+    const bufferStats = Array.from(this.metricsHistory.entries()).map(([processId, buffer]) => ({
+      processId,
+      bufferSize: buffer.getSize(),
+      bufferCapacity: buffer.getCapacity()
+    }));
+
+    return {
+      monitoredProcesses: this.monitoredProcesses.size,
+      metricsBuffers: this.metricsHistory.size,
+      totalMetricsEntries: bufferStats.reduce((sum, stat) => sum + stat.bufferSize, 0),
+      memoryTrackerStats: this.memoryTracker.getMemoryStats(),
+      bufferStats
+    };
+  }
+
+  /**
+   * Optimize memory usage
+   */
+  optimizeMemory(): void {
+    // Clean up buffers for processes that are no longer monitored
+    for (const [processId, buffer] of this.metricsHistory.entries()) {
+      if (!this.monitoredProcesses.has(processId)) {
+        buffer.clear();
+        this.metricsHistory.delete(processId);
+      }
+    }
   }
 }

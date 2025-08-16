@@ -1,0 +1,53 @@
+{
+  "apps": [
+    {
+      "name": "web-server",
+      "script": "server.js",
+      "instances": 4,
+      "autorestart": true,
+      "memory": "512M",
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3000,
+        "API_URL": "https://api.example.com"
+      }
+    },
+    {
+      "name": "api-gateway",
+      "script": "gateway.js",
+      "instances": 2,
+      "autorestart": true,
+      "memory": "256M",
+      "cwd": "./services/gateway",
+      "env": {
+        "NODE_ENV": "production",
+        "GATEWAY_PORT": 8080,
+        "UPSTREAM_TIMEOUT": "30000"
+      }
+    },
+    {
+      "name": "background-worker",
+      "script": "worker.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "1G",
+      "cwd": "./workers",
+      "env": {
+        "WORKER_TYPE": "background",
+        "QUEUE_URL": "redis://localhost:6379",
+        "BATCH_SIZE": "100"
+      }
+    },
+    {
+      "name": "scheduler",
+      "script": "scheduler.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "128M",
+      "env": {
+        "SCHEDULE_INTERVAL": "60000",
+        "TIMEZONE": "UTC"
+      }
+    }
+  ]
+}

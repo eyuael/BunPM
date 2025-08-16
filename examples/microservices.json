@@ -1,0 +1,69 @@
+{
+  "apps": [
+    {
+      "name": "auth-service",
+      "script": "auth/server.js",
+      "instances": 2,
+      "autorestart": true,
+      "memory": "256M",
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3001,
+        "JWT_SECRET": "your-jwt-secret",
+        "DB_URL": "postgresql://localhost:5432/auth"
+      }
+    },
+    {
+      "name": "user-service",
+      "script": "users/server.js",
+      "instances": 3,
+      "autorestart": true,
+      "memory": "512M",
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3002,
+        "AUTH_SERVICE_URL": "http://localhost:3001",
+        "DB_URL": "postgresql://localhost:5432/users"
+      }
+    },
+    {
+      "name": "notification-service",
+      "script": "notifications/server.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "256M",
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3003,
+        "SMTP_HOST": "smtp.example.com",
+        "SMTP_PORT": "587",
+        "REDIS_URL": "redis://localhost:6379"
+      }
+    },
+    {
+      "name": "api-gateway",
+      "script": "gateway/server.js",
+      "instances": 2,
+      "autorestart": true,
+      "memory": "256M",
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3000,
+        "AUTH_SERVICE": "http://localhost:3001",
+        "USER_SERVICE": "http://localhost:3002",
+        "NOTIFICATION_SERVICE": "http://localhost:3003"
+      }
+    },
+    {
+      "name": "metrics-collector",
+      "script": "monitoring/collector.js",
+      "instances": 1,
+      "autorestart": true,
+      "memory": "128M",
+      "env": {
+        "METRICS_PORT": 9090,
+        "COLLECTION_INTERVAL": "30000"
+      }
+    }
+  ]
+}

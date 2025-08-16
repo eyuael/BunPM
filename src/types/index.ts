@@ -422,3 +422,25 @@ export interface DaemonState {
   processes: Record<string, ProcessInstance>;
   socketPath: string;
 }
+
+/**
+ * Error handling types
+ */
+export interface ErrorContext {
+  processId?: string;
+  command?: string;
+  filePath?: string;
+  operation?: string;
+  [key: string]: any;
+}
+
+/**
+ * Error recovery attempt result
+ */
+export interface ErrorRecoveryResult {
+  success: boolean;
+  message: string;
+  retryable: boolean;
+  recoveryStrategy?: string;
+  context?: ErrorContext;
+}

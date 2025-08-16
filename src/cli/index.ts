@@ -2,7 +2,9 @@
 
 import { parseArgs } from "util";
 import { IPCClient, getDefaultSocketPath, isDaemonRunning } from "../ipc/index.js";
+import { DaemonManager } from "../core/daemon-manager.js";
 import { createIPCMessage, ProcessConfig, createProcessConfig } from "../types/index.js";
+import { createUserFriendlyError } from "../core/error-handler.js";
 import { resolve, basename } from "path";
 import { existsSync } from "fs";
 
@@ -89,6 +91,15 @@ async function main() {
         break;
       case 'show':
         await handleShow(commandArgs);
+        break;
+      case 'errors':
+        await handleErrors(commandArgs);
+        break;
+      case 'error-stats':
+        await handleErrorStats(commandArgs);
+        break;
+      case 'daemon':
+        await handleDaemon(commandArgs);
         break;
       default:
         console.error(`Unknown command: ${command}`);
@@ -182,11 +193,8 @@ async function handleStop(args: string[]) {
 
   const processIdentifier = args[0];
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -217,11 +225,8 @@ async function handleRestart(args: string[]) {
 
   const processIdentifier = args[0];
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -244,11 +249,8 @@ async function handleRestart(args: string[]) {
  * Handle list command
  */
 async function handleList(args: string[]) {
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.log('No processes running (daemon not started)');
-    return;
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -408,11 +410,8 @@ async function handleScale(args: string[]) {
     process.exit(1);
   }
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -450,11 +449,8 @@ async function handleLogs(args: string[]) {
   const processIdentifier = args[0];
   const options = parseLogsOptions(args.slice(1));
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -588,6 +584,47 @@ function parseLogsOptions(args: string[]): { lines?: number; follow?: boolean; f
 }
 
 /**
+ * Parse delete command options
+ */
+function parseDeleteOptions(args: string[]): { force?: boolean } {
+  const options: { force?: boolean } = {};
+  
+  for (const arg of args) {
+    if (arg === '--force' || arg === '-f') {
+      options.force = true;
+    }
+  }
+  
+  return options;
+}
+
+/**
+ * Prompt user for confirmation
+ */
+async function promptConfirmation(message: string): Promise<boolean> {
+  process.stdout.write(message + ' ');
+  
+  return new Promise((resolve) => {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    
+    const onData = (key: string) => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdin.removeListener('data', onData);
+      
+      console.log(); // New line after input
+      
+      const response = key.toLowerCase().trim();
+      resolve(response === 'y' || response === 'yes');
+    };
+    
+    process.stdin.on('data', onData);
+  });
+}
+
+/**
  * Handle start from ecosystem file
  */
 async function handleStartFromEcosystem(args: string[]) {
@@ -653,11 +690,8 @@ async function handleSave(args: string[]) {
   const filePath = args[0] || 'ecosystem.json';
   const fullPath = resolve(process.cwd(), filePath);
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -748,26 +782,72 @@ async function handleLoad(args: string[]) {
 async function handleDelete(args: string[]) {
   if (args.length === 0) {
     console.error('Error: Process name or ID is required');
-    console.error('Usage: bun-pm delete <name|id>');
+    console.error('Usage: bun-pm delete <name|id> [--force]');
     process.exit(1);
   }
 
   const processIdentifier = args[0];
+  const options = parseDeleteOptions(args.slice(1));
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
     await client.connect();
-    const message = createIPCMessage('delete', { id: processIdentifier });
-    const response = await client.sendMessage(message);
+
+    // First, get process information for confirmation
+    const infoMessage = createIPCMessage('show', { identifier: processIdentifier });
+    const infoResponse = await client.sendMessage(infoMessage);
+
+    if (!infoResponse.success) {
+      console.error(`✗ Process '${processIdentifier}' not found`);
+      process.exit(1);
+    }
+
+    const processInfo = infoResponse.data.process;
+    const isRunning = processInfo.status === 'running';
+
+    // Show process information and ask for confirmation (unless --force is used)
+    if (!options.force) {
+      console.log(`\nProcess Information:`);
+      console.log(`  Name: ${processInfo.name || processInfo.id}`);
+      console.log(`  ID: ${processInfo.id}`);
+      console.log(`  Status: ${formatStatus(processInfo.status)}`);
+      console.log(`  Script: ${processInfo.script || 'N/A'}`);
+      console.log(`  Instances: ${processInfo.instances || 1}`);
+      
+      if (isRunning) {
+        console.log(`  PID: ${processInfo.pid || 'N/A'}`);
+        console.log(`\n⚠️  This process is currently running and will be stopped before deletion.`);
+      }
+
+      console.log(`\n⚠️  This action will permanently remove the process configuration.`);
+      console.log(`    All process instances will be stopped and the configuration will be deleted.`);
+      
+      const confirmation = await promptConfirmation(`\nAre you sure you want to delete process '${processInfo.name || processInfo.id}'? (y/N)`);
+      
+      if (!confirmation) {
+        console.log('Delete operation cancelled.');
+        return;
+      }
+    }
+
+    // Proceed with deletion
+    const deleteMessage = createIPCMessage('delete', { 
+      identifier: processIdentifier,
+      force: options.force 
+    });
+    const response = await client.sendMessage(deleteMessage);
 
     if (response.success) {
       console.log(`✓ ${response.data.message}`);
+      if (response.data.stoppedInstances && response.data.stoppedInstances.length > 0) {
+        console.log(`  Stopped ${response.data.stoppedInstances.length} running instance(s)`);
+      }
+      if (response.data.removedLogs) {
+        console.log(`  Cleaned up log files`);
+      }
     } else {
       console.error(`✗ Failed to delete process: ${response.error}`);
       process.exit(1);
@@ -781,11 +861,8 @@ async function handleDelete(args: string[]) {
  * Handle monit command - real-time resource monitoring
  */
 async function handleMonit(args: string[]) {
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   console.log('Real-time process monitoring (Press Ctrl+C to exit)');
   console.log('Refreshing every 5 seconds...\n');
@@ -926,11 +1003,8 @@ async function handleShow(args: string[]) {
 
   const processIdentifier = args[0];
 
-  // Check if daemon is running
-  if (!(await isDaemonRunning())) {
-    console.error('Error: Daemon is not running');
-    process.exit(1);
-  }
+  // Ensure daemon is running
+  await ensureDaemonRunning();
 
   const client = new IPCClient(getDefaultSocketPath());
   try {
@@ -1078,53 +1152,262 @@ function parseEnvVars(envArgs: string[]): Record<string, string> {
 }
 
 /**
+ * Handle daemon management commands
+ */
+async function handleDaemon(args: string[]) {
+  if (args.length === 0) {
+    console.error('Error: Daemon subcommand is required');
+    console.error('Usage: bun-pm daemon <status|start|stop|restart>');
+    process.exit(1);
+  }
+
+  const subcommand = args[0];
+  const daemonManager = new DaemonManager(getDefaultSocketPath());
+
+  switch (subcommand) {
+    case 'status':
+      await handleDaemonStatus(daemonManager);
+      break;
+    case 'start':
+      await handleDaemonStart(daemonManager);
+      break;
+    case 'stop':
+      await handleDaemonStop(daemonManager);
+      break;
+    case 'restart':
+      await handleDaemonRestart(daemonManager);
+      break;
+    default:
+      console.error(`Unknown daemon subcommand: ${subcommand}`);
+      console.error('Usage: bun-pm daemon <status|start|stop|restart>');
+      process.exit(1);
+  }
+}
+
+/**
+ * Handle daemon status command
+ */
+async function handleDaemonStatus(daemonManager: DaemonManager) {
+  try {
+    const status = await daemonManager.getDaemonStatus();
+    
+    console.log('=== Daemon Status ===');
+    console.log(`Overall Status: ${status.healthStatus.toUpperCase()}`);
+    console.log(`Socket Responding: ${status.socketResponding ? '✓' : '✗'}`);
+    console.log(`PID File Exists: ${status.pidFileExists ? '✓' : '✗'}`);
+    console.log(`Process Running: ${status.processRunning ? '✓' : '✗'}`);
+    
+    if (status.daemonInfo) {
+      console.log('\n=== Daemon Information ===');
+      console.log(`PID: ${status.daemonInfo.pid}`);
+      console.log(`Start Time: ${status.daemonInfo.startTime.toLocaleString()}`);
+      console.log(`Socket Path: ${status.daemonInfo.socketPath}`);
+      if (status.daemonInfo.version) {
+        console.log(`Version: ${status.daemonInfo.version}`);
+      }
+      
+      // Calculate uptime
+      const uptime = Date.now() - status.daemonInfo.startTime.getTime();
+      const uptimeSeconds = Math.floor(uptime / 1000);
+      console.log(`Uptime: ${formatUptimeSeconds(uptimeSeconds)}`);
+    }
+    
+    if (status.healthStatus === 'unhealthy') {
+      console.log('\n⚠️  Daemon state is inconsistent. Consider running "bun-pm daemon restart"');
+    } else if (status.healthStatus === 'unknown') {
+      console.log('\n💡 Daemon is not running. Use "bun-pm daemon start" to start it');
+    }
+    
+  } catch (error) {
+    console.error(`Error getting daemon status: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Handle daemon start command
+ */
+async function handleDaemonStart(daemonManager: DaemonManager) {
+  try {
+    const status = await daemonManager.getDaemonStatus();
+    
+    if (status.healthStatus === 'healthy') {
+      console.log('Daemon is already running and healthy');
+      return;
+    }
+    
+    await daemonManager.startDaemon();
+  } catch (error) {
+    console.error(`Error starting daemon: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Handle daemon stop command
+ */
+async function handleDaemonStop(daemonManager: DaemonManager) {
+  try {
+    await daemonManager.stopDaemon();
+  } catch (error) {
+    console.error(`Error stopping daemon: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Handle daemon restart command
+ */
+async function handleDaemonRestart(daemonManager: DaemonManager) {
+  try {
+    await daemonManager.restartDaemon();
+  } catch (error) {
+    console.error(`Error restarting daemon: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+}
+
+/**
  * Ensure daemon is running, start if needed
  */
 async function ensureDaemonRunning(): Promise<void> {
-  if (await isDaemonRunning()) {
-    return;
-  }
+  const daemonManager = new DaemonManager(getDefaultSocketPath());
+  await daemonManager.ensureDaemonRunning();
+}
 
-  console.log('Starting daemon...');
-  
-  // Import and start daemon
-  const { ProcessDaemon } = await import('../daemon/daemon.js');
-  const daemon = new ProcessDaemon(getDefaultSocketPath());
-  
-  // Start daemon in background
-  const daemonProcess = Bun.spawn({
-    cmd: [process.execPath, '-e', `
-      const { ProcessDaemon } = await import('${import.meta.resolve('../daemon/daemon.js')}');
-      const daemon = new ProcessDaemon('${getDefaultSocketPath()}');
-      await daemon.start();
+/**
+ * Handle errors command
+ */
+async function handleErrors(args: string[]): Promise<void> {
+  try {
+    const limit = args.length > 0 ? parseInt(args[0]) : 50;
+    
+    if (isNaN(limit) || limit < 1) {
+      console.error('Error: Limit must be a positive integer');
+      process.exit(1);
+    }
+
+    const client = new IPCClient();
+    await client.connect();
+
+    const message = createIPCMessage('errors', { limit });
+    const response = await client.sendMessage(message);
+
+    if (response.success && response.data) {
+      const { errors, totalCount } = response.data;
       
-      // Keep daemon running
-      process.on('SIGTERM', async () => {
-        await daemon.stop();
-        process.exit(0);
-      });
+      if (errors.length === 0) {
+        console.log('No errors found.');
+        return;
+      }
+
+      console.log(`\n📋 Error History (showing ${errors.length} of ${totalCount} errors)\n`);
       
-      process.on('SIGINT', async () => {
-        await daemon.stop();
-        process.exit(0);
-      });
-    `],
-    stdio: ['ignore', 'ignore', 'ignore'],
-    detached: true
-  });
-
-  // Unref the process so it doesn't keep the parent alive
-  daemonProcess.unref();
-
-  // Wait a moment for daemon to start
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Verify daemon started
-  if (!(await isDaemonRunning())) {
-    throw new Error('Failed to start daemon');
+      for (const error of errors) {
+        const timestamp = new Date(error.timestamp).toLocaleString();
+        const severityIcon = getSeverityIcon(error.severity);
+        const categoryBadge = `[${error.category.toUpperCase()}]`;
+        
+        console.log(`${severityIcon} ${timestamp} ${categoryBadge}`);
+        console.log(`   ${error.message}`);
+        
+        if (error.context && Object.keys(error.context).length > 0) {
+          const contextStr = Object.entries(error.context)
+            .filter(([key]) => !['originalError', 'stack'].includes(key))
+            .map(([key, value]) => `${key}: ${value}`)
+            .join(', ');
+          if (contextStr) {
+            console.log(`   Context: ${contextStr}`);
+          }
+        }
+        console.log('');
+      }
+    } else {
+      console.error(`Error getting error history: ${response.error}`);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error('Error:', createUserFriendlyError(error instanceof Error ? error : new Error(String(error))));
+    process.exit(1);
   }
-  
-  console.log('✓ Daemon started');
+}
+
+/**
+ * Handle error stats command
+ */
+async function handleErrorStats(args: string[]): Promise<void> {
+  try {
+    const client = new IPCClient();
+    await client.connect();
+
+    const message = createIPCMessage('errorStats', {});
+    const response = await client.sendMessage(message);
+
+    if (response.success && response.data) {
+      const { daemon, processManager, combined } = response.data;
+      
+      console.log('\n📊 Error Statistics\n');
+      
+      // Combined stats
+      console.log('🔄 Overall Statistics:');
+      console.log(`   Total Errors: ${combined.total}`);
+      console.log(`   Recent (1h): ${combined.recent}`);
+      console.log('');
+      
+      // By severity
+      console.log('🚨 By Severity:');
+      const severities = ['critical', 'error', 'warning', 'info'];
+      for (const severity of severities) {
+        const count = combined.bySeverity[severity] || 0;
+        if (count > 0) {
+          const icon = getSeverityIcon(severity);
+          console.log(`   ${icon} ${severity}: ${count}`);
+        }
+      }
+      console.log('');
+      
+      // By category
+      console.log('📂 By Category:');
+      const categories = Object.entries(combined.byCategory)
+        .filter(([, count]) => count > 0)
+        .sort(([, a], [, b]) => (b as number) - (a as number));
+      
+      for (const [category, count] of categories) {
+        console.log(`   ${category}: ${count}`);
+      }
+      
+      if (categories.length === 0) {
+        console.log('   No errors by category');
+      }
+      
+      console.log('');
+      
+      // Component breakdown
+      console.log('🔧 By Component:');
+      console.log(`   Daemon: ${daemon.total} errors`);
+      console.log(`   Process Manager: ${processManager.total} errors`);
+      
+    } else {
+      console.error(`Error getting error statistics: ${response.error}`);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error('Error:', createUserFriendlyError(error instanceof Error ? error : new Error(String(error))));
+    process.exit(1);
+  }
+}
+
+/**
+ * Get severity icon
+ */
+function getSeverityIcon(severity: string): string {
+  switch (severity) {
+    case 'critical': return '🔥';
+    case 'error': return '❌';
+    case 'warning': return '⚠️';
+    case 'info': return 'ℹ️';
+    default: return '❓';
+  }
 }
 
 /**
@@ -1149,6 +1432,9 @@ COMMANDS:
   show <name|id>        Show detailed process information
   save [file]           Save current processes to ecosystem file
   load <file>           Load processes from ecosystem file
+  errors [limit]        Show recent error history
+  error-stats           Show error statistics
+  daemon <subcommand>   Manage daemon (status|start|stop|restart)
 
 START OPTIONS:
   --name <name>           Set process name
@@ -1163,6 +1449,9 @@ LOGS OPTIONS:
   --lines <n>            Number of lines to show (default: 100)
   --follow, -f           Follow log output in real-time
   --filter <pattern>     Filter logs by pattern (regex)
+
+DELETE OPTIONS:
+  --force, -f            Skip confirmation prompt
 
 GLOBAL OPTIONS:
   --help, -h         Show this help message
@@ -1185,6 +1474,7 @@ EXAMPLES:
   bun-pm restart api
   bun-pm scale web-server 8
   bun-pm delete old-process
+  bun-pm delete web-server --force
   bun-pm list
   
   # Logging

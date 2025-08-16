@@ -11,6 +11,14 @@
     "build": "bun build src/cli/index.ts --outdir dist --target bun",
     "dev": "bun run src/cli/index.ts",
     "test": "bun test",
+    "test:unit": "bun test test/*.test.ts",
+    "test:integration": "bun test test/integration/*.test.ts --timeout 60000",
+    "test:performance": "bun test test/performance/*.test.ts --timeout 120000",
+    "test:performance-suite": "bun run test/performance/run-performance-suite.ts",
+    "benchmark": "bun run test/performance/run-performance-suite.ts",
+    "test:stress": "bun test test/stress/*.test.ts --timeout 180000",
+    "test:e2e": "bun test test/e2e/*.test.ts --timeout 300000",
+    "test:comprehensive": "bun run test/run-comprehensive-tests.ts",
     "clean": "rm -rf dist"
   },
   "keywords": [

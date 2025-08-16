@@ -13,17 +13,155 @@ import {
 } from "../types/index.js";
 
 /**
- * IPC Server for daemon-side communication using TCP
+ * Connection pool for managing WebSocket connections efficiently
+ */
+class ConnectionPool {
+  private connections = new Map<string, {
+    ws: any;
+    lastActivity: number;
+    messageCount: number;
+  }>();
+  private readonly maxConnections: number;
+  private readonly connectionTimeout: number;
+  private cleanupInterval: Timer | null = null;
+
+  constructor(maxConnections: number = 100, connectionTimeout: number = 300000) { // 5 minutes
+    this.maxConnections = maxConnections;
+    this.connectionTimeout = connectionTimeout;
+    this.startCleanup();
+  }
+
+  addConnection(id: string, ws: any): void {
+    // Remove oldest connection if at capacity
+    if (this.connections.size >= this.maxConnections) {
+      this.evictOldestConnection();
+    }
+
+    this.connections.set(id, {
+      ws,
+      lastActivity: Date.now(),
+      messageCount: 0
+    });
+  }
+
+  updateActivity(id: string): void {
+    const conn = this.connections.get(id);
+    if (conn) {
+      conn.lastActivity = Date.now();
+      conn.messageCount++;
+    }
+  }
+
+  removeConnection(id: string): void {
+    this.connections.delete(id);
+  }
+
+  getConnection(id: string) {
+    return this.connections.get(id);
+  }
+
+  getConnectionCount(): number {
+    return this.connections.size;
+  }
+
+  getStats() {
+    const now = Date.now();
+    const connections = Array.from(this.connections.values());
+    
+    return {
+      total: connections.length,
+      active: connections.filter(c => now - c.lastActivity < 60000).length, // Active in last minute
+      totalMessages: connections.reduce((sum, c) => sum + c.messageCount, 0),
+      avgMessagesPerConnection: connections.length > 0 
+        ? connections.reduce((sum, c) => sum + c.messageCount, 0) / connections.length 
+        : 0
+    };
+  }
+
+  private evictOldestConnection(): void {
+    let oldestId: string | null = null;
+    let oldestTime = Date.now();
+
+    for (const [id, conn] of this.connections.entries()) {
+      if (conn.lastActivity < oldestTime) {
+        oldestTime = conn.lastActivity;
+        oldestId = id;
+      }
+    }
+
+    if (oldestId) {
+      const conn = this.connections.get(oldestId);
+      if (conn) {
+        try {
+          conn.ws.close();
+        } catch (error) {
+          // Ignore close errors
+        }
+        this.connections.delete(oldestId);
+      }
+    }
+  }
+
+  private startCleanup(): void {
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupStaleConnections();
+    }, 60000); // Cleanup every minute
+  }
+
+  private cleanupStaleConnections(): void {
+    const now = Date.now();
+    const staleConnections: string[] = [];
+
+    for (const [id, conn] of this.connections.entries()) {
+      if (now - conn.lastActivity > this.connectionTimeout) {
+        staleConnections.push(id);
+      }
+    }
+
+    for (const id of staleConnections) {
+      const conn = this.connections.get(id);
+      if (conn) {
+        try {
+          conn.ws.close();
+        } catch (error) {
+          // Ignore close errors
+        }
+        this.connections.delete(id);
+      }
+    }
+  }
+
+  cleanup(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    // Close all connections
+    for (const [id, conn] of this.connections.entries()) {
+      try {
+        conn.ws.close();
+      } catch (error) {
+        // Ignore close errors
+      }
+    }
+    this.connections.clear();
+  }
+}
+
+/**
+ * IPC Server for daemon-side communication using TCP with connection pooling
  */
 export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
   private port: number = 0;
   private messageHandlers: Map<string, (message: IPCMessage) => Promise<IPCResponse>> = new Map();
-  private connections: Set<any> = new Set();
+  private connectionPool: ConnectionPool;
 
   constructor(socketPath: string) {
     this.socketPath = socketPath;
+    this.connectionPool = new ConnectionPool();
   }
 
   /**
@@ -60,7 +198,12 @@ export class IPCServer {
       websocket: {
         message: async (ws, message) => {
           let messageId = 'unknown';
+          const connectionId = this.getConnectionId(ws);
+          
           try {
+            // Update connection activity
+            this.connectionPool.updateActivity(connectionId);
+            
             const messageStr = message.toString();
             const ipcMessage = deserializeIPCMessage(messageStr);
             messageId = ipcMessage.id;
@@ -92,14 +235,17 @@ export class IPCServer {
           }
         },
         open: (ws) => {
-          this.connections.add(ws);
+          const connectionId = this.getConnectionId(ws);
+          this.connectionPool.addConnection(connectionId, ws);
         },
         close: (ws) => {
-          this.connections.delete(ws);
+          const connectionId = this.getConnectionId(ws);
+          this.connectionPool.removeConnection(connectionId);
         },
         error: (ws, error) => {
           console.error('WebSocket error:', error);
-          this.connections.delete(ws);
+          const connectionId = this.getConnectionId(ws);
+          this.connectionPool.removeConnection(connectionId);
         }
       }
     });
@@ -117,11 +263,8 @@ export class IPCServer {
    */
   async stop(): Promise<void> {
     if (this.server) {
-      // Close all connections
-      for (const ws of this.connections) {
-        ws.close();
-      }
-      this.connections.clear();
+      // Clean up connection pool
+      this.connectionPool.cleanup();
 
       this.server.stop();
       this.server = null;
@@ -137,7 +280,25 @@ export class IPCServer {
    * Get the number of active connections
    */
   getConnectionCount(): number {
-    return this.connections.size;
+    return this.connectionPool.getConnectionCount();
+  }
+
+  /**
+   * Get connection statistics
+   */
+  getConnectionStats() {
+    return this.connectionPool.getStats();
+  }
+
+  /**
+   * Generate a unique connection ID for a WebSocket
+   */
+  private getConnectionId(ws: any): string {
+    // Use a combination of timestamp and random number for unique ID
+    if (!ws._connectionId) {
+      ws._connectionId = `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+    return ws._connectionId;
   }
 
   /**
@@ -297,6 +458,11 @@ export class IPCClient {
  * Utility function to get default socket path
  */
 export function getDefaultSocketPath(): string {
+  // Check for custom socket path in environment variable
+  if (process.env.BUN_PM_SOCKET) {
+    return process.env.BUN_PM_SOCKET;
+  }
+  
   const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
   return `${homeDir}/.bun-pm/daemon.sock`;
 }
