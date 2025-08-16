@@ -27,7 +27,7 @@ describe("CLI Interface", () => {
 
     const output = await new Response(proc.stdout).text();
     expect(output).toContain("bun-pm - Bun Process Manager");
-    expect(output).toContain("start <script>");
+    expect(output).toContain("start <script|config>");
     expect(output).toContain("stop <name|id>");
     expect(output).toContain("restart <name|id>");
     expect(output).toContain("list, ls");
@@ -64,8 +64,8 @@ describe("CLI Interface", () => {
     });
 
     const error = await new Response(proc.stderr).text();
-    expect(error).toContain("Script path is required");
-    expect(error).toContain("Usage: bun-pm start <script> [options]");
+    expect(error).toContain("Script path or ecosystem file is required");
+    expect(error).toContain("Usage: bun-pm start <script|ecosystem.json> [options]");
   });
 
   test("should show error for stop command without identifier", async () => {
@@ -100,6 +100,6 @@ describe("CLI Interface", () => {
     });
 
     const output = await new Response(proc.stdout).text();
-    expect(output).toContain("No processes running (daemon not started)");
+    expect(output).toContain("No processes running");
   });
 });

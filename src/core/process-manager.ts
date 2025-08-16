@@ -7,6 +7,7 @@ import {
   incrementRestartCount
 } from "../types/index.js";
 import { LogManager } from "./log-manager.js";
+import { MonitorManager } from "./monitor-manager.js";
 
 /**
  * Core process manager that handles process lifecycle operations
@@ -16,9 +17,19 @@ export class ProcessManager {
   private restartTimeouts: Map<string, Timer> = new Map();
   private processConfigs: Map<string, ProcessConfig> = new Map();
   private logManager: LogManager;
+  private monitorManager?: MonitorManager;
+  private memoryCheckInterval?: Timer;
 
-  constructor(logManager?: LogManager) {
+  constructor(logManager?: LogManager, monitorManager?: MonitorManager) {
     this.logManager = logManager || new LogManager();
+    this.monitorManager = monitorManager;
+
+    // Set up periodic memory limit checking (every 30 seconds)
+    if (this.monitorManager) {
+      this.memoryCheckInterval = setInterval(() => {
+        this.checkMemoryLimits();
+      }, 30000);
+    }
   }
 
   /**
@@ -45,6 +56,11 @@ export class ProcessManager {
 
         // Set up process monitoring
         this.setupProcessMonitoring(instance, config);
+
+        // Start resource monitoring
+        if (this.monitorManager) {
+          this.monitorManager.startMonitoring(instanceId, instance.pid, instance.startTime);
+        }
       } catch (error) {
         throw new Error(`Failed to start process '${instanceId}': ${error}`);
       }
@@ -89,6 +105,11 @@ export class ProcessManager {
       // Stop log capture
       this.logManager.stopCapture(id);
 
+      // Stop resource monitoring
+      if (this.monitorManager) {
+        this.monitorManager.stopMonitoring(id);
+      }
+
       // Remove from processes map after a short delay to allow exit handler to run
       setTimeout(() => {
         this.processes.delete(id);
@@ -127,6 +148,11 @@ export class ProcessManager {
 
     // Set up monitoring for the new instance
     this.setupProcessMonitoring(newInstance, config);
+
+    // Start resource monitoring for the new instance
+    if (this.monitorManager) {
+      this.monitorManager.startMonitoring(id, newInstance.pid, newInstance.startTime);
+    }
 
     return newInstance;
   }
@@ -187,9 +213,15 @@ export class ProcessManager {
       throw new Error('Instance count must be at least 1');
     }
 
-    // Find all instances of this process
+    // Find the base process ID (remove instance suffix if present)
+    const baseId = id.includes('_') ? id.split('_')[0] : id;
+    
+    // Find all instances of this process (both single instance and clustered)
     const processInstances = Array.from(this.processes.entries())
-      .filter(([instanceId]) => instanceId.startsWith(id))
+      .filter(([instanceId]) => {
+        // Match exact ID for single instance or base ID for clustered instances
+        return instanceId === baseId || instanceId.startsWith(`${baseId}_`);
+      })
       .map(([, instance]) => instance);
 
     if (processInstances.length === 0) {
@@ -202,40 +234,78 @@ export class ProcessManager {
       return processInstances;
     }
 
-    // Get base config from first instance (simplified for this implementation)
-    const baseConfig: ProcessConfig = {
-      id,
-      name: id,
-      script: 'placeholder',
-      cwd: process.cwd(),
-      env: {},
-      instances,
-      autorestart: true,
-      maxRestarts: 10
-    };
+    // Get the stored configuration for this process
+    const config = this.processConfigs.get(baseId);
+    if (!config) {
+      throw new Error(`Configuration for process '${baseId}' not found`);
+    }
+
+    // Update the config instances count
+    const updatedConfig = { ...config, instances };
+    this.processConfigs.set(baseId, updatedConfig);
 
     if (instances > currentCount) {
-      // Scale up - start new instances manually to avoid ID conflicts
+      // Scale up - start new instances
       const newInstances: ProcessInstance[] = [];
 
+      // If scaling from 1 to multiple instances, rename the existing instance
+      if (currentCount === 1 && instances > 1) {
+        const existingInstance = processInstances[0];
+        if (existingInstance.id === baseId) {
+          // Rename existing instance to include _0 suffix
+          this.processes.delete(baseId);
+          const renamedInstance = { ...existingInstance, id: `${baseId}_0` };
+          this.processes.set(`${baseId}_0`, renamedInstance);
+          processInstances[0] = renamedInstance;
+        }
+      }
+
       for (let i = currentCount; i < instances; i++) {
-        const instanceId = `${id}_${i}`;
-        const instance = await this.spawnProcess(baseConfig, instanceId, i);
+        const instanceId = instances > 1 ? `${baseId}_${i}` : baseId;
+        const instance = await this.spawnProcess(updatedConfig, instanceId, i);
         this.processes.set(instanceId, instance);
         newInstances.push(instance);
-        this.setupProcessMonitoring(instance, baseConfig);
+        this.setupProcessMonitoring(instance, updatedConfig);
+
+        // Start resource monitoring for new instance
+        if (this.monitorManager) {
+          this.monitorManager.startMonitoring(instanceId, instance.pid, instance.startTime);
+        }
       }
 
       return [...processInstances, ...newInstances];
     } else {
       // Scale down - stop excess instances
-      const instancesToStop = processInstances.slice(instances);
+      // Sort instances to stop the highest numbered ones first
+      const sortedInstances = processInstances.sort((a, b) => {
+        const aIndex = a.id.includes('_') ? parseInt(a.id.split('_')[1] || '0') : 0;
+        const bIndex = b.id.includes('_') ? parseInt(b.id.split('_')[1] || '0') : 0;
+        return bIndex - aIndex; // Descending order
+      });
 
+      const instancesToStop = sortedInstances.slice(0, currentCount - instances);
+      const remainingInstances = sortedInstances.slice(currentCount - instances);
+
+      // Stop instances sequentially to avoid race conditions
       for (const instance of instancesToStop) {
         await this.stop(instance.id);
+        // Wait a moment for the process to be fully removed
+        await new Promise(resolve => setTimeout(resolve, 50));
       }
 
-      return processInstances.slice(0, instances);
+      // If scaling down to 1 instance, rename the remaining instance to remove suffix
+      if (instances === 1 && remainingInstances.length === 1) {
+        const remainingInstance = remainingInstances[0];
+        if (remainingInstance.id.includes('_')) {
+          // Remove the old instance and add it with the base ID
+          this.processes.delete(remainingInstance.id);
+          const renamedInstance = { ...remainingInstance, id: baseId };
+          this.processes.set(baseId, renamedInstance);
+          return [renamedInstance];
+        }
+      }
+
+      return remainingInstances;
     }
   }
 
@@ -248,10 +318,13 @@ export class ProcessManager {
     // Prepare environment variables
     const env = { ...process.env, ...config.env };
 
-    // Add PORT for clustering
+    // Add PORT for clustering (requirement 4.2)
     if (config.instances > 1) {
       const basePort = parseInt(env.PORT || '3000');
       env.PORT = (basePort + instanceIndex).toString();
+      
+      // Also set NODE_APP_INSTANCE for compatibility with other process managers
+      env.NODE_APP_INSTANCE = instanceIndex.toString();
     }
 
     try {
@@ -279,6 +352,126 @@ export class ProcessManager {
       return instance;
     } catch (error) {
       throw new Error(`Failed to spawn process: ${error}`);
+    }
+  }
+
+  /**
+   * Check memory limits for all processes and restart if necessary
+   */
+  private checkMemoryLimits(): void {
+    if (!this.monitorManager) {
+      return;
+    }
+
+    // Build memory limits map for efficient checking
+    const memoryLimits = new Map<string, number>();
+    for (const [instanceId] of this.processes) {
+      const config = this.getConfig(instanceId);
+      if (config && config.memoryLimit) {
+        memoryLimits.set(instanceId, config.memoryLimit);
+      }
+    }
+
+    // Check all processes at once
+    const violatingProcesses = this.monitorManager.checkAllMemoryLimits(memoryLimits);
+
+    // Handle each violating process
+    for (const instanceId of violatingProcesses) {
+      const instance = this.processes.get(instanceId);
+      const config = this.getConfig(instanceId);
+      
+      if (!instance || !config) {
+        continue;
+      }
+
+      const currentMemory = this.monitorManager.getCurrentMemoryUsage(instanceId);
+      console.log(`Process ${instanceId} exceeded memory limit (${currentMemory} bytes > ${config.memoryLimit} bytes), restarting...`);
+      
+      // Update restart count for monitoring
+      if (this.monitorManager) {
+        this.monitorManager.updateRestartCount(instanceId, instance.restartCount + 1);
+      }
+
+      // Restart the process due to memory limit violation (requirement 2.5)
+      this.restartDueToMemoryLimit(instanceId).catch(error => {
+        console.error(`Failed to restart process ${instanceId} due to memory limit:`, error);
+      });
+    }
+  }
+
+  /**
+   * Restart a process specifically due to memory limit violation
+   */
+   private async restartDueToMemoryLimit(instanceId: string): Promise<void> {
+    const instance = this.processes.get(instanceId);
+    const config = this.getConfig(instanceId);
+    
+    if (!instance || !config) {
+      throw new Error(`Process ${instanceId} not found for memory limit restart`);
+    }
+
+    // Check if we can still restart (respect maxRestarts limit)
+    if (instance.restartCount >= config.maxRestarts) {
+      console.error(`Process ${instanceId} exceeded max restart attempts (${config.maxRestarts}) due to memory limits, marking as errored`);
+      const erroredInstance = updateProcessStatus(instance, 'errored');
+      this.processes.set(instanceId, erroredInstance);
+      return;
+    }
+
+    // Increment restart count and mark as restarting
+    const restartingInstance = updateProcessStatus(
+      incrementRestartCount(instance),
+      'restarting'
+    );
+    this.processes.set(instanceId, restartingInstance);
+
+    try {
+      // Stop the current process
+      instance.subprocess.kill('SIGTERM');
+      
+      // Wait for process to exit
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Force kill if still running
+      if (!instance.subprocess.killed) {
+        instance.subprocess.kill('SIGKILL');
+      }
+
+      // Stop log capture and monitoring for old process
+      this.logManager.stopCapture(instanceId);
+      if (this.monitorManager) {
+        this.monitorManager.stopMonitoring(instanceId);
+      }
+
+      // Wait a moment for cleanup
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Determine the instance index for proper PORT assignment
+      const instanceIndex = instanceId.includes('_') ? 
+        parseInt(instanceId.split('_')[1] || '0') : 0;
+
+      // Start new instance
+      const newInstance = await this.spawnProcess(config, instanceId, instanceIndex);
+      
+      // Preserve the restart count from the restarting instance
+      const newInstanceWithCount = { ...newInstance, restartCount: restartingInstance.restartCount };
+      this.processes.set(instanceId, newInstanceWithCount);
+
+      // Set up monitoring for the new instance
+      this.setupProcessMonitoring(newInstanceWithCount, config);
+
+      // Start resource monitoring for restarted instance
+      if (this.monitorManager) {
+        this.monitorManager.startMonitoring(instanceId, newInstance.pid, newInstance.startTime);
+      }
+
+      console.log(`Process ${instanceId} restarted successfully due to memory limit (PID: ${newInstance.pid})`);
+    } catch (error) {
+      console.error(`Failed to restart process ${instanceId} due to memory limit:`, error);
+      
+      // Mark as errored if restart failed
+      const erroredInstance = updateProcessStatus(restartingInstance, 'errored');
+      this.processes.set(instanceId, erroredInstance);
     }
   }
 
@@ -380,14 +573,23 @@ export class ProcessManager {
         // Remove the failed instance from tracking
         this.processes.delete(instance.id);
 
-        // Start new instance with same config but preserve restart count
-        const newInstance = await this.spawnSingleInstance(restartConfig, instance.id, 0);
+        // Determine the instance index for proper PORT assignment
+        const instanceIndex = instance.id.includes('_') ? 
+          parseInt(instance.id.split('_')[1] || '0') : 0;
+
+        // Start new instance with same config but preserve restart count (requirement 4.4)
+        const newInstance = await this.spawnSingleInstance(restartConfig, instance.id, instanceIndex);
         // Preserve the restart count from the restarting instance
         const newInstanceWithCount = { ...newInstance, restartCount: restartingInstance.restartCount };
         this.processes.set(instance.id, newInstanceWithCount);
 
         // Set up monitoring for the new instance
         this.setupProcessMonitoring(newInstanceWithCount, config);
+
+        // Start resource monitoring for restarted instance
+        if (this.monitorManager) {
+          this.monitorManager.startMonitoring(instance.id, newInstance.pid, newInstance.startTime);
+        }
 
         console.log(`Process ${instance.id} restarted successfully (PID: ${newInstance.pid})`);
       } catch (error) {
@@ -419,6 +621,12 @@ export class ProcessManager {
    * Clean up all processes and resources
    */
   async cleanup(): Promise<void> {
+    // Clear memory check interval
+    if (this.memoryCheckInterval) {
+      clearInterval(this.memoryCheckInterval);
+      this.memoryCheckInterval = undefined;
+    }
+
     // Clear all restart timeouts
     for (const timeout of this.restartTimeouts.values()) {
       clearTimeout(timeout);

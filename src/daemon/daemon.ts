@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from "fs";
 import { IPCServer, getDefaultSocketPath } from "../ipc/socket.js";
 import { ProcessManager } from "../core/process-manager.js";
 import { LogManager } from "../core/log-manager.js";
+import { ConfigManager } from "../core/config-manager.js";
+import { MonitorManager } from "../core/monitor-manager.js";
 import {
     IPCMessage,
     IPCResponse,
@@ -20,6 +22,8 @@ export class ProcessDaemon {
     private ipcServer: IPCServer;
     private processManager: ProcessManager;
     private logManager: LogManager;
+    private configManager: ConfigManager;
+    private monitorManager: MonitorManager;
     private socketPath: string;
     private stateFilePath: string;
     private isRunning: boolean = false;
@@ -30,7 +34,9 @@ export class ProcessDaemon {
         this.stateFilePath = this.getStateFilePath();
         this.ipcServer = new IPCServer(this.socketPath);
         this.logManager = new LogManager();
-        this.processManager = new ProcessManager(this.logManager);
+        this.monitorManager = new MonitorManager();
+        this.processManager = new ProcessManager(this.logManager, this.monitorManager);
+        this.configManager = new ConfigManager();
 
         this.setupCommandHandlers();
     }
@@ -87,6 +93,9 @@ export class ProcessDaemon {
             // Stop all managed processes
             await this.processManager.cleanup();
 
+            // Clean up monitoring
+            this.monitorManager.cleanup();
+
             // Stop IPC server
             await this.ipcServer.stop();
 
@@ -139,6 +148,11 @@ export class ProcessDaemon {
         // Configuration commands
         this.ipcServer.registerHandler('save', this.handleSaveCommand.bind(this));
         this.ipcServer.registerHandler('load', this.handleLoadCommand.bind(this));
+        this.ipcServer.registerHandler('startFromFile', this.handleStartFromFileCommand.bind(this));
+
+        // Monitoring commands
+        this.ipcServer.registerHandler('monit', this.handleMonitCommand.bind(this));
+        this.ipcServer.registerHandler('show', this.handleShowCommand.bind(this));
     }
 
     /**
@@ -188,17 +202,40 @@ export class ProcessDaemon {
      */
     private async handleStopCommand(message: IPCMessage): Promise<IPCResponse> {
         try {
-            const { id } = message.payload;
+            const { identifier } = message.payload;
 
-            if (!id) {
-                return createErrorResponse(message.id, 'Process id is required');
+            if (!identifier) {
+                return createErrorResponse(message.id, 'Process identifier is required');
             }
 
-            await this.processManager.stop(id);
+            // Check if this is a request to stop all instances of a process
+            const processes = this.processManager.list();
+            const matchingProcesses = processes.filter(p => 
+                p.id === identifier || 
+                p.id.startsWith(`${identifier}_`) ||
+                (this.processConfigs.get(identifier.includes('_') ? identifier.split('_')[0] : identifier)?.name === identifier)
+            );
+
+            if (matchingProcesses.length === 0) {
+                return createErrorResponse(message.id, `Process '${identifier}' not found`);
+            }
+
+            // Stop all matching processes
+            const stopPromises = matchingProcesses.map(process => 
+                this.processManager.stop(process.id)
+            );
+            
+            await Promise.all(stopPromises);
             await this.saveState();
 
+            const stoppedCount = matchingProcesses.length;
+            const message_text = stoppedCount === 1 
+                ? `Process '${identifier}' stopped successfully`
+                : `Stopped ${stoppedCount} instances of process '${identifier}'`;
+
             return createSuccessResponse(message.id, {
-                message: `Process '${id}' stopped successfully`
+                message: message_text,
+                stoppedInstances: matchingProcesses.map(p => p.id)
             });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -211,23 +248,45 @@ export class ProcessDaemon {
      */
     private async handleRestartCommand(message: IPCMessage): Promise<IPCResponse> {
         try {
-            const { id } = message.payload;
+            const { identifier } = message.payload;
 
-            if (!id) {
-                return createErrorResponse(message.id, 'Process id is required');
+            if (!identifier) {
+                return createErrorResponse(message.id, 'Process identifier is required');
             }
 
-            const instance = await this.processManager.restart(id);
+            // Check if this is a request to restart all instances of a process
+            const processes = this.processManager.list();
+            const matchingProcesses = processes.filter(p => 
+                p.id === identifier || 
+                p.id.startsWith(`${identifier}_`) ||
+                (this.processConfigs.get(identifier.includes('_') ? identifier.split('_')[0] : identifier)?.name === identifier)
+            );
+
+            if (matchingProcesses.length === 0) {
+                return createErrorResponse(message.id, `Process '${identifier}' not found`);
+            }
+
+            // Restart all matching processes
+            const restartPromises = matchingProcesses.map(process => 
+                this.processManager.restart(process.id)
+            );
+            
+            const restartedInstances = await Promise.all(restartPromises);
             await this.saveState();
 
+            const restartedCount = restartedInstances.length;
+            const message_text = restartedCount === 1 
+                ? `Process '${identifier}' restarted successfully`
+                : `Restarted ${restartedCount} instances of process '${identifier}'`;
+
             return createSuccessResponse(message.id, {
-                message: `Process '${id}' restarted successfully`,
-                instance: {
+                message: message_text,
+                instances: restartedInstances.map(instance => ({
                     id: instance.id,
                     pid: instance.pid,
                     status: instance.status,
                     startTime: instance.startTime
-                }
+                }))
             });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -450,17 +509,109 @@ export class ProcessDaemon {
                 return createErrorResponse(message.id, 'File path is required');
             }
 
-            const ecosystemConfig = {
-                apps: Array.from(this.processConfigs.values()),
-                version: '1.0.0',
-                created: new Date()
-            };
+            const configs = Array.from(this.processConfigs.values());
+            
+            if (configs.length === 0) {
+                return createErrorResponse(message.id, 'No process configurations to save');
+            }
 
-            await Bun.write(filePath, JSON.stringify(ecosystemConfig, null, 2));
+            const validation = await this.configManager.saveEcosystemFile(filePath, configs);
+
+            if (!validation.isValid) {
+                return createErrorResponse(message.id, `Failed to save configuration:\n${validation.errors.join('\n')}`);
+            }
 
             return createSuccessResponse(message.id, {
                 message: `Configuration saved to ${filePath}`,
-                processCount: this.processConfigs.size
+                processCount: configs.length,
+                processes: configs.map(c => ({ id: c.id, name: c.name }))
+            });
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
+     * Handle start from ecosystem file command
+     */
+    private async handleStartFromFileCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const { filePath, appName } = message.payload;
+
+            if (!filePath) {
+                return createErrorResponse(message.id, 'File path is required');
+            }
+
+            // Parse ecosystem configuration file
+            const { config: ecosystemConfig, errors: parseErrors } = await this.configManager.parseEcosystemFile(filePath);
+
+            if (parseErrors.length > 0) {
+                return createErrorResponse(message.id, `Configuration file errors:\n${parseErrors.join('\n')}`);
+            }
+
+            if (ecosystemConfig.apps.length === 0) {
+                return createErrorResponse(message.id, 'No valid app configurations found in file');
+            }
+
+            // If appName is specified, start only that app
+            let appsToStart = ecosystemConfig.apps;
+            if (appName) {
+                appsToStart = ecosystemConfig.apps.filter(app => app.name === appName || app.id === appName);
+                if (appsToStart.length === 0) {
+                    return createErrorResponse(message.id, `App '${appName}' not found in configuration file`);
+                }
+            }
+
+            const results = [];
+            let successCount = 0;
+
+            for (const config of appsToStart) {
+                try {
+                    // Check if process already exists
+                    if (this.processConfigs.has(config.id)) {
+                        results.push({
+                            id: config.id,
+                            name: config.name,
+                            success: false,
+                            error: `Process with id '${config.id}' already exists`
+                        });
+                        continue;
+                    }
+
+                    const instances = await this.processManager.start(config);
+                    this.processConfigs.set(config.id, config);
+                    successCount++;
+
+                    results.push({
+                        id: config.id,
+                        name: config.name,
+                        success: true,
+                        instances: instances.length,
+                        pids: instances.map(i => i.pid)
+                    });
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+                    results.push({
+                        id: config.id,
+                        name: config.name,
+                        success: false,
+                        error: errorMessage
+                    });
+                }
+            }
+
+            await this.saveState();
+
+            const message_text = appName 
+                ? `Started app '${appName}' from ${filePath}`
+                : `Started ${successCount}/${appsToStart.length} processes from ${filePath}`;
+
+            return createSuccessResponse(message.id, {
+                message: message_text,
+                totalApps: appsToStart.length,
+                successCount,
+                results
             });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -479,42 +630,49 @@ export class ProcessDaemon {
                 return createErrorResponse(message.id, 'File path is required');
             }
 
-            if (!existsSync(filePath)) {
-                return createErrorResponse(message.id, `Configuration file not found: ${filePath}`);
+            // Parse ecosystem configuration file
+            const { config: ecosystemConfig, errors: parseErrors } = await this.configManager.parseEcosystemFile(filePath);
+
+            if (parseErrors.length > 0) {
+                return createErrorResponse(message.id, `Configuration file errors:\n${parseErrors.join('\n')}`);
             }
 
-            const configFile = Bun.file(filePath);
-            const configData = await configFile.json();
-
-            if (!configData.apps || !Array.isArray(configData.apps)) {
-                return createErrorResponse(message.id, 'Invalid configuration file format');
+            if (ecosystemConfig.apps.length === 0) {
+                return createErrorResponse(message.id, 'No valid app configurations found in file');
             }
 
             const results = [];
-            for (const config of configData.apps) {
+            let successCount = 0;
+
+            for (const config of ecosystemConfig.apps) {
                 try {
-                    const validation = validateProcessConfig(config);
-                    if (!validation.isValid) {
+                    // Check if process already exists
+                    if (this.processConfigs.has(config.id)) {
                         results.push({
-                            id: config.id || 'unknown',
+                            id: config.id,
+                            name: config.name,
                             success: false,
-                            error: validation.errors.join(', ')
+                            error: `Process with id '${config.id}' already exists`
                         });
                         continue;
                     }
 
                     const instances = await this.processManager.start(config);
                     this.processConfigs.set(config.id, config);
+                    successCount++;
 
                     results.push({
                         id: config.id,
+                        name: config.name,
                         success: true,
-                        instances: instances.length
+                        instances: instances.length,
+                        pids: instances.map(i => i.pid)
                     });
                 } catch (error) {
                     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
                     results.push({
-                        id: config.id || 'unknown',
+                        id: config.id,
+                        name: config.name,
                         success: false,
                         error: errorMessage
                     });
@@ -523,9 +681,126 @@ export class ProcessDaemon {
 
             await this.saveState();
 
+            const message_text = successCount > 0 
+                ? `Successfully loaded ${successCount}/${ecosystemConfig.apps.length} processes from ${filePath}`
+                : `Failed to load any processes from ${filePath}`;
+
             return createSuccessResponse(message.id, {
-                message: `Loaded configuration from ${filePath}`,
+                message: message_text,
+                totalApps: ecosystemConfig.apps.length,
+                successCount,
                 results
+            });
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
+     * Handle monit command - real-time monitoring
+     */
+    private async handleMonitCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const processes = this.processManager.list();
+            const systemInfo = await this.monitorManager.getSystemInfo();
+
+            // Get metrics for all processes
+            const processesWithMetrics = processes.map(process => {
+                const config = this.processConfigs.get(process.id.split('_')[0]) || 
+                              this.processConfigs.get(process.id);
+                const metrics = this.monitorManager.getMetrics(process.id);
+
+                return {
+                    id: process.id,
+                    name: config?.name || process.id,
+                    status: process.status,
+                    pid: process.pid,
+                    script: config?.script,
+                    cwd: config?.cwd,
+                    instances: config?.instances || 1,
+                    autorestart: config?.autorestart,
+                    maxRestarts: config?.maxRestarts,
+                    memoryLimit: config?.memoryLimit,
+                    env: config?.env,
+                    startTime: process.startTime,
+                    restartCount: process.restartCount,
+                    metrics: metrics
+                };
+            });
+
+            return createSuccessResponse(message.id, {
+                processes: processesWithMetrics,
+                systemInfo: systemInfo
+            });
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            return createErrorResponse(message.id, errorMessage);
+        }
+    }
+
+    /**
+     * Handle show command - detailed process information
+     */
+    private async handleShowCommand(message: IPCMessage): Promise<IPCResponse> {
+        try {
+            const { identifier } = message.payload;
+
+            if (!identifier) {
+                return createErrorResponse(message.id, 'Process identifier is required');
+            }
+
+            // Find the process
+            const processes = this.processManager.list();
+            let process = processes.find(p => {
+                // Direct ID match
+                if (p.id === identifier) return true;
+                
+                // Clustered process ID match (e.g., "app_0", "app_1")
+                if (p.id.startsWith(`${identifier}_`)) return true;
+                
+                // Find by name - check all configs for matching name
+                const baseId = p.id.includes('_') ? p.id.split('_')[0] : p.id;
+                const config = this.processConfigs.get(baseId);
+                if (config && config.name === identifier) return true;
+                
+                return false;
+            });
+
+            if (!process) {
+                return createErrorResponse(message.id, `Process '${identifier}' not found`);
+            }
+
+            // Get process configuration
+            const config = this.processConfigs.get(process.id.split('_')[0]) || 
+                          this.processConfigs.get(process.id);
+
+            // Get current metrics
+            const metrics = this.monitorManager.getMetrics(process.id);
+
+            // Get metrics history
+            const history = this.monitorManager.getMetricsHistory(process.id);
+
+            const processInfo = {
+                id: process.id,
+                name: config?.name || process.id,
+                status: process.status,
+                pid: process.pid,
+                script: config?.script,
+                cwd: config?.cwd,
+                instances: config?.instances || 1,
+                autorestart: config?.autorestart,
+                maxRestarts: config?.maxRestarts,
+                memoryLimit: config?.memoryLimit,
+                env: config?.env,
+                startTime: process.startTime,
+                restartCount: process.restartCount
+            };
+
+            return createSuccessResponse(message.id, {
+                process: processInfo,
+                metrics: metrics,
+                history: history
             });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
