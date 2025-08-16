@@ -35,5 +35,8 @@
     "dist/**/*",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "dependencies": {
+    "@types/node": "^24.3.0"
+  }
 }
