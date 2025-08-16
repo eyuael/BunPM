@@ -5,7 +5,7 @@
   "main": "dist/cli/index.js",
   "type": "module",
   "bin": {
-    "bun-pm": "./dist/cli/index.js"
+    "bun-pm": "./src/cli/index.ts"
   },
   "scripts": {
     "build": "bun build src/cli/index.ts --outdir dist --target bun",

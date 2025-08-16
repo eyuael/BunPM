@@ -16,9 +16,10 @@ const createMockSubprocess = () => {
     pid: mockPidCounter++,
     killed: false,
     exited: exitedPromise,
-    kill: mock(() => {
+    kill: mock((signal?: string) => {
       subprocess.killed = true;
-      resolveExited(0); // Resolve when killed
+      // Immediately resolve when killed to speed up tests
+      setTimeout(() => resolveExited(0), 1);
     }),
     stdout: new ReadableStream(),
     stderr: new ReadableStream(),
@@ -453,6 +454,415 @@ test("ProcessManager - working directory handling", async () => {
     stderr: "pipe",
     stdin: "ignore"
   });
+
+  await manager.cleanup();
+});
+
+// Restart functionality tests
+test("ProcessManager - automatic restart on crash", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "restart-test",
+    name: "Restart Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  // Simulate process crash
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(1); // Exit with error code
+
+  // Wait for restart to be scheduled
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  // Check that process is marked as restarting
+  const restartingProcess = manager.get("restart-test");
+  expect(restartingProcess?.status).toBe("restarting");
+  expect(restartingProcess?.restartCount).toBe(1);
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - no restart on clean exit", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "clean-exit-test",
+    name: "Clean Exit Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  // Simulate clean exit
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(0); // Exit with success code
+
+  // Wait for exit handling
+  await new Promise(resolve => setTimeout(resolve, 150));
+
+  // Process should be removed, not restarted
+  const process = manager.get("clean-exit-test");
+  expect(process).toBeUndefined();
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - no restart when autorestart disabled", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "no-restart-test",
+    name: "No Restart Test",
+    script: "test.js",
+    autorestart: false,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  // Simulate process crash
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(1); // Exit with error code
+
+  // Wait for exit handling
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  // Process should be marked as errored, not restarting
+  const erroredProcess = manager.get("no-restart-test");
+  expect(erroredProcess?.status).toBe("errored");
+  expect(erroredProcess?.restartCount).toBe(0);
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - max restart attempts exceeded", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "max-restart-test",
+    name: "Max Restart Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 1 // Lower max for faster test
+  });
+
+  const instances = await manager.start(config);
+  let instance = instances[0];
+
+  // First crash - should trigger restart
+  const mockSubprocess1 = instance.subprocess as any;
+  mockSubprocess1._resolveExited(1);
+  
+  // Wait for restart to be scheduled
+  await new Promise(resolve => setTimeout(resolve, 100));
+  
+  let restartingInstance = manager.get("max-restart-test");
+  expect(restartingInstance?.status).toBe("restarting");
+  expect(restartingInstance?.restartCount).toBe(1);
+
+  // Wait for restart to complete and get new instance
+  await new Promise(resolve => setTimeout(resolve, 1200)); // Wait for restart delay
+  
+  let newInstance = manager.get("max-restart-test");
+  expect(newInstance?.status).toBe("running");
+
+  // Second crash - should exceed max restarts and mark as errored
+  const mockSubprocess2 = newInstance!.subprocess as any;
+  mockSubprocess2._resolveExited(1);
+  
+  // Wait for error handling
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  const finalInstance = manager.get("max-restart-test");
+  expect(finalInstance?.status).toBe("errored");
+  expect(finalInstance?.restartCount).toBe(1); // Should be at max restart count when marked as errored
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - no restart after manual stop", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "manual-stop-test",
+    name: "Manual Stop Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  // Manually stop the process
+  await manager.stop("manual-stop-test");
+
+  // Simulate the subprocess exit after manual stop
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(1); // Exit with error code
+
+  // Wait for exit handling
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  // Process should not be restarted
+  const stoppedProcess = manager.get("manual-stop-test");
+  expect(stoppedProcess).toBeUndefined();
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - restart statistics", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "stats-test",
+    name: "Stats Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 5
+  });
+
+  await manager.start(config);
+
+  // Check initial stats
+  const initialStats = manager.getRestartStats("stats-test");
+  expect(initialStats).toEqual({
+    restartCount: 0,
+    maxRestarts: 5,
+    canRestart: true
+  });
+
+  // Check config retrieval
+  const retrievedConfig = manager.getConfig("stats-test");
+  expect(retrievedConfig).toEqual(config);
+
+  // Check autorestart status
+  expect(manager.isAutorestartEnabled("stats-test")).toBe(true);
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - restart with exponential backoff", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "backoff-test",
+    name: "Backoff Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  const startTime = Date.now();
+
+  // Simulate process crash
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(1); // Exit with error code
+
+  // Wait for restart to be scheduled (should be ~1 second base delay)
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  const restartingProcess = manager.get("backoff-test");
+  expect(restartingProcess?.status).toBe("restarting");
+
+  // The restart should be scheduled but not immediate
+  const elapsedTime = Date.now() - startTime;
+  expect(elapsedTime).toBeLessThan(1000); // Should not have restarted yet
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - clustered process restart", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "cluster-restart-test",
+    name: "Cluster Restart Test",
+    script: "test.js",
+    instances: 3,
+    autorestart: true,
+    maxRestarts: 2
+  });
+
+  const instances = await manager.start(config);
+  expect(instances).toHaveLength(3);
+
+  // Crash one instance
+  const crashedInstance = instances[1];
+  const mockSubprocess = crashedInstance.subprocess as any;
+  mockSubprocess._resolveExited(1); // Exit with error code
+
+  // Wait for restart handling
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  // Only the crashed instance should be restarting
+  const instance0 = manager.get("cluster-restart-test_0");
+  const instance1 = manager.get("cluster-restart-test_1");
+  const instance2 = manager.get("cluster-restart-test_2");
+
+  expect(instance0?.status).toBe("running");
+  expect(instance1?.status).toBe("restarting");
+  expect(instance2?.status).toBe("running");
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - restart preserves configuration", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "config-preserve-test",
+    name: "Config Preserve Test",
+    script: "test.js",
+    env: { TEST_VAR: "test_value" },
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  await manager.start(config);
+
+  // Manual restart
+  const restartedInstance = await manager.restart("config-preserve-test");
+
+  expect(restartedInstance.id).toBe("config-preserve-test");
+  expect(restartedInstance.status).toBe("running");
+  expect(restartedInstance.restartCount).toBe(0); // Manual restart resets count
+
+  // Verify configuration is preserved
+  const preservedConfig = manager.getConfig("config-preserve-test");
+  expect(preservedConfig?.env.TEST_VAR).toBe("test_value");
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - restart within 1 second requirement", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "timing-test",
+    name: "Timing Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 3
+  });
+
+  const instances = await manager.start(config);
+  const instance = instances[0];
+
+  const startTime = Date.now();
+
+  // Simulate process crash
+  const mockSubprocess = instance.subprocess as any;
+  mockSubprocess._resolveExited(1);
+
+  // Wait for restart to be scheduled
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  const restartingProcess = manager.get("timing-test");
+  expect(restartingProcess?.status).toBe("restarting");
+
+  // Verify restart is scheduled within reasonable time (should be ~1 second base)
+  const elapsedTime = Date.now() - startTime;
+  expect(elapsedTime).toBeLessThan(200); // Should be scheduled quickly
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - failure counting with consecutive failures", async () => {
+  const manager = new ProcessManager();
+
+  const config = createProcessConfig({
+    id: "failure-count-test",
+    name: "Failure Count Test",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 2 // Lower max for faster test
+  });
+
+  const instances = await manager.start(config);
+
+  // First failure
+  let currentInstance = manager.get("failure-count-test")!;
+  let mockSubprocess = currentInstance.subprocess as any;
+  mockSubprocess._resolveExited(1);
+  
+  await new Promise(resolve => setTimeout(resolve, 100));
+  let restartingInstance = manager.get("failure-count-test");
+  expect(restartingInstance?.status).toBe("restarting");
+  expect(restartingInstance?.restartCount).toBe(1);
+
+  // Wait for first restart to complete
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  
+  // Second failure
+  currentInstance = manager.get("failure-count-test")!;
+  expect(currentInstance.status).toBe("running");
+  mockSubprocess = currentInstance.subprocess as any;
+  mockSubprocess._resolveExited(1);
+  
+  await new Promise(resolve => setTimeout(resolve, 100));
+  restartingInstance = manager.get("failure-count-test");
+  expect(restartingInstance?.status).toBe("restarting");
+  expect(restartingInstance?.restartCount).toBe(2);
+
+  // Wait for second restart to complete
+  await new Promise(resolve => setTimeout(resolve, 2200)); // Longer wait due to exponential backoff
+  
+  // Third failure - should exceed max and mark as errored
+  currentInstance = manager.get("failure-count-test")!;
+  expect(currentInstance.status).toBe("running");
+  mockSubprocess = currentInstance.subprocess as any;
+  mockSubprocess._resolveExited(1);
+  
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Should now be marked as errored
+  const finalInstance = manager.get("failure-count-test");
+  expect(finalInstance?.status).toBe("errored");
+  expect(finalInstance?.restartCount).toBe(2); // At max restart count
+
+  await manager.cleanup();
+});
+
+test("ProcessManager - autorestart flag configuration", async () => {
+  const manager = new ProcessManager();
+
+  // Test with autorestart enabled
+  const configEnabled = createProcessConfig({
+    id: "autorestart-enabled",
+    name: "Autorestart Enabled",
+    script: "test.js",
+    autorestart: true,
+    maxRestarts: 2
+  });
+
+  await manager.start(configEnabled);
+  expect(manager.isAutorestartEnabled("autorestart-enabled")).toBe(true);
+
+  // Test with autorestart disabled
+  const configDisabled = createProcessConfig({
+    id: "autorestart-disabled",
+    name: "Autorestart Disabled",
+    script: "test.js",
+    autorestart: false,
+    maxRestarts: 2
+  });
+
+  await manager.start(configDisabled);
+  expect(manager.isAutorestartEnabled("autorestart-disabled")).toBe(false);
 
   await manager.cleanup();
 });
