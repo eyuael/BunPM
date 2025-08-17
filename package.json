@@ -1,11 +1,11 @@
 {
-  "name": "bun-process-manager",
+  "name": "bunpm",
   "version": "1.0.0",
   "description": "A Bun-native process manager inspired by PM2",
   "main": "dist/cli/index.js",
   "type": "module",
   "bin": {
-    "bun-pm": "./src/cli/index.ts"
+    "bun-pm": "./dist/cli/index.js"
   },
   "scripts": {
     "build": "bun build src/cli/index.ts --outdir dist --target bun",
@@ -41,6 +41,7 @@
   },
   "files": [
     "dist/**/*",
+    "src/**/*",
     "README.md",
     "LICENSE"
   ],

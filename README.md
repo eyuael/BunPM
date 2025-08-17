@@ -19,7 +19,7 @@ A Bun-native process manager inspired by PM2 that leverages Bun's built-in tools
 
 ```bash
 git clone <repository-url>
-cd bun-process-manager
+cd bunpm
 bun install
 bun run build
 ```
@@ -28,7 +28,7 @@ bun run build
 
 ```bash
 # Install globally (when published)
-bun install -g bun-process-manager
+bun install -g bunpm
 ```
 
 ## Quick Start
@@ -280,8 +280,8 @@ See the [examples documentation](./examples/README.md) for detailed explanations
 
 ```bash
 # Clone and install dependencies
-git clone <repository-url>
-cd bun-process-manager
+git clone https://github.com/eyuael/BunPM.git
+cd bunpm
 bun install
 ```
 
